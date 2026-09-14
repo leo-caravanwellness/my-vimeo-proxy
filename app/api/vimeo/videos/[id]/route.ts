@@ -1,43 +1,34 @@
 import { NextResponse } from "next/server";
+import { TOKEN_TO_SHOWCASE } from "../../../../lib/showcaseTokens";
+import { logAccess } from "../../../../lib/logAccess";
 
 const VIMEO_TOKEN = process.env.VIMEO_TOKEN!;
-const ALBUM_ID = process.env.VIMEO_ALBUM_ID;
-const API_SECRET = process.env.API_SECRET;
 
-function loadShowcaseTokens(): Record<string, string | undefined> {
-  const tokenMap: Record<string, string | undefined> = {};
-
-  if (API_SECRET) {
-    tokenMap[API_SECRET] = ALBUM_ID;
-  }
-
-  Object.keys(process.env).forEach((key) => {
-    const match = key.match(/^SHOWCASE_TOKEN_([A-Z0-9_]+)$/);
-    if (match) {
-      const identifier = match[1];
-      const token = process.env[key];
-      const albumId = process.env[`SHOWCASE_ALBUM_ID_${identifier}`];
-      if (token && albumId) {
-        tokenMap[token] = albumId;
-      }
-    }
-  });
-
-  return tokenMap;
+function clientIp(req: Request): string | undefined {
+  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? undefined;
 }
-
-const TOKEN_TO_ALBUM = loadShowcaseTokens();
 
 export async function GET(
   req: Request,
   { params }: { params: { id: string } }
 ) {
+  const ip = clientIp(req);
+  const videoId = params.id;
+
   try {
     const authHeader = req.headers.get("authorization");
     const providedSecret = authHeader?.replace("Bearer ", "");
 
-    const validTokens = Object.keys(TOKEN_TO_ALBUM).filter((t) => t !== "");
+    const validTokens = Object.keys(TOKEN_TO_SHOWCASE).filter((t) => t !== "");
     if (!providedSecret || !validTokens.includes(providedSecret)) {
+      logAccess({
+        identifier: "UNAUTHORIZED",
+        endpoint: "/api/vimeo/videos/[id]",
+        method: "GET",
+        status: 401,
+        videoId,
+        ip,
+      });
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
@@ -45,15 +36,14 @@ export async function GET(
       return NextResponse.json({ error: "Missing VIMEO_TOKEN" }, { status: 500 });
     }
 
-    const albumId = TOKEN_TO_ALBUM[providedSecret];
+    const showcase = TOKEN_TO_SHOWCASE[providedSecret];
+    const albumId = showcase.albumId;
     if (!albumId) {
       return NextResponse.json(
         { error: "No showcase configured for this token" },
         { status: 500 }
       );
     }
-
-    const videoId = params.id;
 
     // This endpoint returns the video only if it belongs to the album,
     // otherwise Vimeo returns 404 — so membership check is built in.
@@ -69,6 +59,15 @@ export async function GET(
     );
 
     if (r.status === 404) {
+      logAccess({
+        identifier: showcase.identifier,
+        endpoint: "/api/vimeo/videos/[id]",
+        method: "GET",
+        status: 404,
+        albumId,
+        videoId,
+        ip,
+      });
       const response = NextResponse.json(
         { error: "Video not found in this showcase" },
         { status: 404 }
@@ -81,6 +80,15 @@ export async function GET(
 
     if (!r.ok) {
       const text = await r.text();
+      logAccess({
+        identifier: showcase.identifier,
+        endpoint: "/api/vimeo/videos/[id]",
+        method: "GET",
+        status: r.status,
+        albumId,
+        videoId,
+        ip,
+      });
       const response = NextResponse.json({ error: "Vimeo error", detail: text }, { status: r.status });
       response.headers.set('Access-Control-Allow-Origin', '*');
       response.headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -89,6 +97,15 @@ export async function GET(
     }
 
     const data = await r.json();
+    logAccess({
+      identifier: showcase.identifier,
+      endpoint: "/api/vimeo/videos/[id]",
+      method: "GET",
+      status: 200,
+      albumId,
+      videoId,
+      ip,
+    });
     const response = NextResponse.json({ success: true, data });
     response.headers.set('Access-Control-Allow-Origin', '*');
     response.headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
