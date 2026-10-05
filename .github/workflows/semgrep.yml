@@ -1,0 +1,208 @@
+name: Semgrep
+
+# Static analysis with Semgrep's free community rules.
+#  - Pull requests: only findings the PR introduces are reported; any new
+#    ERROR-severity finding fails the check.
+#  - Pushes to the default branch and the weekly run: full scan. New ERROR and
+#    WARNING findings are filed as issues in caravanwellnessnyc/security-findings
+#    (where SLA tracking picks them up), and open issues whose finding is no
+#    longer detected are closed with a link to the clean scan.
+# Everything runs inside GitHub Actions; no code or results are sent to Semgrep.
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 12 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: semgrep-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:1.179.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # PR scans diff against the base commit, which needs history.
+          fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+          persist-credentials: false
+
+      - name: Run Semgrep
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          set -- --config p/default --metrics=off --timeout 30 \
+            --json-output semgrep.json --sarif-output semgrep.sarif
+          if [ -n "$BASE_SHA" ]; then
+            set -- "$@" --baseline-commit "$BASE_SHA"
+          fi
+          semgrep scan "$@"
+
+      - name: Summarize findings
+        id: summarize
+        env:
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 - <<'EOF'
+          import hashlib, json, os
+
+          data = json.load(open('semgrep.json'))
+          findings, seen = [], {}
+          for r in data['results']:
+              path = r['path']
+              # Community Semgrep doesn't emit fingerprints, so build one from the
+              # rule, file and normalized source text. It survives line shifts,
+              # so the same finding maps to the same issue across scans.
+              try:
+                  with open(path, encoding='utf-8', errors='replace') as f:
+                      src = f.read().splitlines()[r['start']['line'] - 1:r['end']['line']]
+                  code = ' '.join(' '.join(src).split())
+              except OSError:
+                  code = ''
+              key = f"{r['check_id']}|{path}|{code}"
+              n = seen.get(key, 0)
+              seen[key] = n + 1
+              meta = r['extra'].get('metadata', {})
+              findings.append({
+                  'fingerprint': hashlib.sha256(f'{key}|{n}'.encode()).hexdigest()[:16],
+                  'rule': r['check_id'],
+                  'severity': r['extra']['severity'],
+                  'path': path,
+                  'line': r['start']['line'],
+                  'endLine': r['end']['line'],
+                  'message': r['extra']['message'][:1000],
+                  'ruleUrl': meta.get('source') or meta.get('shortlink'),
+                  'cwe': meta.get('cwe'),
+              })
+
+          json.dump({'repo': os.environ['REPO'], 'sha': os.environ['SHA'], 'findings': findings},
+                    open('findings.json', 'w'), indent=1)
+
+          counts = {s: sum(f['severity'] == s for f in findings) for s in ('ERROR', 'WARNING', 'INFO')}
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('## Semgrep\n\n')
+              out.write(f"ERROR: {counts['ERROR']} · WARNING: {counts['WARNING']} · INFO: {counts['INFO']}\n\n")
+              if findings:
+                  out.write('| Severity | Rule | Location |\n|---|---|---|\n')
+                  for f in findings:
+                      out.write(f"| {f['severity']} | `{f['rule'].split('.')[-1]}` | `{f['path']}:{f['line']}` |\n")
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f"errors={counts['ERROR']}\n")
+          EOF
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: semgrep-results
+          path: |
+            semgrep.json
+            semgrep.sarif
+            findings.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Fail on new ERROR findings
+        if: github.event_name == 'pull_request' && steps.summarize.outputs.errors != '0'
+        run: |
+          echo "::error::This PR introduces ${{ steps.summarize.outputs.errors }} ERROR-severity Semgrep finding(s). See the job summary."
+          exit 1
+
+  file-issues:
+    needs: scan
+    if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: semgrep-results
+
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          # Fine-grained PAT scoped to caravanwellnessnyc/security-findings, Issues: read/write.
+          # A PAT (not GITHUB_TOKEN) is needed to write cross-repo, and so the
+          # SLA Tracking workflow there fires on the new issues.
+          github-token: ${{ secrets.SECURITY_FINDINGS_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const { repo, sha, findings } = JSON.parse(fs.readFileSync('findings.json', 'utf8'));
+            const target = { owner: 'caravanwellnessnyc', repo: 'security-findings' };
+            const MARKER = /<!-- semgrep:(\S+) (\S+) -->/;
+            const PRIORITY = {
+              ERROR: ['priority: high', 'High (14 day SLA)'],
+              WARNING: ['priority: medium', 'Medium (30 day SLA)'],
+            };
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+            const existing = await github.paginate(github.rest.issues.listForRepo, {
+              ...target, state: 'all', labels: 'source: sast', per_page: 100,
+            });
+            const byFingerprint = new Map();
+            for (const issue of existing) {
+              const m = (issue.body || '').match(MARKER);
+              if (m && m[1] === repo) byFingerprint.set(m[2], issue);
+            }
+
+            const current = new Set();
+            for (const f of findings) {
+              if (!PRIORITY[f.severity]) continue; // INFO stays in the run summary only
+              current.add(f.fingerprint);
+              const lines = f.endLine > f.line ? `#L${f.line}-L${f.endLine}` : `#L${f.line}`;
+              const link = `https://github.com/${repo}/blob/${sha}/${f.path}${lines}`;
+              const prior = byFingerprint.get(f.fingerprint);
+
+              if (!prior) {
+                const [label, priorityText] = PRIORITY[f.severity];
+                const rule = f.ruleUrl ? `[\`${f.rule}\`](${f.ruleUrl})` : `\`${f.rule}\``;
+                const body = [
+                  '### Link to source', '', link, '',
+                  '### Priority', '', priorityText, '',
+                  '### Source', '', 'SAST', '',
+                  '### Description', '',
+                  `Semgrep rule ${rule} (${f.severity}) in \`${repo}\`.`, '',
+                  f.message, '',
+                  f.cwe ? `CWE: ${[].concat(f.cwe).join(', ')}\n` : '',
+                  `Filed automatically from [this scan](${runUrl}). If it's a false positive or accepted risk, close it as "not planned" with the reason; it won't be refiled.`, '',
+                  '### Assignee / Owner', '', '_No response_', '',
+                  `<!-- semgrep:${repo} ${f.fingerprint} -->`,
+                ].join('\n');
+                const { data: issue } = await github.rest.issues.create({
+                  ...target,
+                  title: `[Finding]: ${f.rule.split('.').pop()} in ${repo.split('/')[1]}/${f.path}`,
+                  labels: ['finding', 'source: sast', label],
+                  body,
+                });
+                core.info(`Filed #${issue.number} for ${f.rule} at ${f.path}:${f.line}`);
+                await sleep(1000);
+              } else if (prior.state === 'closed' && prior.state_reason === 'completed') {
+                await github.rest.issues.update({ ...target, issue_number: prior.number, state: 'open' });
+                await github.rest.issues.createComment({
+                  ...target, issue_number: prior.number,
+                  body: `Reopened: this finding was detected again in [this scan](${runUrl}) at ${link}.`,
+                });
+                core.info(`Reopened #${prior.number}`);
+              }
+            }
+
+            for (const [fingerprint, issue] of byFingerprint) {
+              if (issue.state !== 'open' || current.has(fingerprint)) continue;
+              await github.rest.issues.createComment({
+                ...target, issue_number: issue.number,
+                body: `No longer detected in [this scan](${runUrl}) of ${repo}@${sha.slice(0, 7)}. Closing as remediated.`,
+              });
+              await github.rest.issues.update({
+                ...target, issue_number: issue.number, state: 'closed', state_reason: 'completed',
+              });
+              core.info(`Closed #${issue.number}`);
+            }
