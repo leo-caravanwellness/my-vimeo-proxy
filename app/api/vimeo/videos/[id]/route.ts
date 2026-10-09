@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { TOKEN_TO_SHOWCASE } from "../../../../lib/showcaseTokens";
+import { resolveShowcase } from "../../../../lib/showcaseTokens";
 import { logAccess } from "../../../../lib/logAccess";
 
 const VIMEO_TOKEN = process.env.VIMEO_TOKEN!;
@@ -19,8 +19,8 @@ export async function GET(
     const authHeader = req.headers.get("authorization");
     const providedSecret = authHeader?.replace("Bearer ", "");
 
-    const validTokens = Object.keys(TOKEN_TO_SHOWCASE).filter((t) => t !== "");
-    if (!providedSecret || !validTokens.includes(providedSecret)) {
+    const showcase = await resolveShowcase(providedSecret);
+    if (!showcase) {
       logAccess({
         identifier: "UNAUTHORIZED",
         endpoint: "/api/vimeo/videos/[id]",
@@ -36,7 +36,6 @@ export async function GET(
       return NextResponse.json({ error: "Missing VIMEO_TOKEN" }, { status: 500 });
     }
 
-    const showcase = TOKEN_TO_SHOWCASE[providedSecret];
     const albumId = showcase.albumId;
     if (!albumId) {
       return NextResponse.json(

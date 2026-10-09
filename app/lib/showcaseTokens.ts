@@ -1,3 +1,5 @@
+import { createTokenRegistry, resolveToken, s3RegistryFetcher } from "./tokenRegistry";
+
 const API_SECRET = process.env.API_SECRET;
 const DEFAULT_ALBUM_ID = process.env.VIMEO_ALBUM_ID;
 
@@ -38,3 +40,18 @@ function loadShowcaseTokens(): Record<string, ShowcaseTokenInfo> {
 
 // Map tokens to their respective album ID + identifier
 export const TOKEN_TO_SHOWCASE = loadShowcaseTokens();
+
+// Content Studio token registry (private S3 object, cached ~60s per instance).
+const registry = createTokenRegistry({
+  fetch: s3RegistryFetcher({
+    bucket: process.env.CS_TOKEN_BUCKET ?? "caravan-content-studio-private",
+    key: process.env.CS_TOKEN_KEY ?? "proxy-tokens.json",
+    region: process.env.AWS_REGION,
+  }),
+});
+
+// Resolve a bearer token to its showcase: env tokens first, then the
+// Content Studio registry. Returns undefined if the token is not valid.
+export function resolveShowcase(token: string | undefined): Promise<ShowcaseTokenInfo | undefined> {
+  return resolveToken(token, TOKEN_TO_SHOWCASE, registry);
+}
